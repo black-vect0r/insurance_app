@@ -14,6 +14,11 @@ from pathlib import Path
 
 import httpx
 
+from backend.health_plans import (
+    format_plan_recommendations,
+    get_health_plan_catalog,
+    recommend_health_plans,
+)
 
 # -----------------------------------------------------------------------------
 # Secure API Key Loading
@@ -220,7 +225,7 @@ Be professional, data-driven, and reference Indian insurance regulations (IRDAI)
 Use Rs for monetary values and Indian terminology."""
 
 
-CHATBOT_PROMPT = """You are an Insurance Underwriting Chatbot for underwriters.
+CHATBOT_PROMPT = """You are a Health Insurance Underwriting Chatbot for underwriters and advisors.
 Answer only using:
 1) Provided application details,
 2) Structured risk assessment,
@@ -231,6 +236,27 @@ Rules:
 - If evidence is missing, say "Not found in provided documents".
 - Mention relevant compliance rule IDs where possible.
 - Do not provide legal advice; provide underwriting guidance.
+- Prioritize health insurance discussion (hospitalization, PED waiting period, copay, exclusions, room rent limits).
+- If the user asks for plan options, recommend only from the provided plan_catalog context.
+- For any risk prediction request, ask for missing profile inputs before estimating risk.
+- Use uploaded application/assessment context only when the question is explicitly case-specific.
+- For general questions, answer with general insurance guidance and do not anchor to the uploaded case.
+"""
+
+PLAN_RECOMMENDATION_PROMPT = """You are a health insurance plan recommendation assistant.
+Use ONLY the provided context JSON.
+
+Output format:
+1) One-line profile summary
+2) One-line risk summary (if available)
+3) Exactly 3 recommended plans from shortlisted_plans, ordered best to acceptable
+4) For each plan, explain why it fits this user's profile
+5) List missing details that would improve recommendation quality (if any)
+
+Rules:
+- Do not invent plans outside plan_catalog/shortlisted_plans.
+- Prioritize suitability for age, smoking status, pre-existing conditions, and inferred risk.
+- Keep response concise and practical.
 """
 
 
@@ -304,6 +330,429 @@ def _normalize_assessment(result: dict) -> dict:
 
 def _contains_any(text: str, words) -> bool:
     return any(w in text for w in words)
+
+
+def _is_plan_request(question: str) -> bool:
+    q = str(question or "").lower()
+    keywords = [
+        "plan",
+        "policy options",
+        "recommend plan",
+        "suggest plan",
+        "best plan",
+        "health plan",
+        "which policy",
+        "which plan",
+        "coverage option",
+        "product recommendation",
+    ]
+    return _contains_any(q, keywords)
+
+
+def _is_risk_prediction_request(question: str) -> bool:
+    q = str(question or "").lower()
+    keywords = [
+        "risk factor",
+        "risk score",
+        "my risk",
+        "underwriting risk",
+        "insurance risk",
+        "how risky",
+        "what will be my risk",
+        "what is my risk",
+    ]
+    return _contains_any(q, keywords)
+
+
+def _is_partial_risk_followup(question: str) -> bool:
+    q = str(question or "").lower()
+    keywords = [
+        "just based on this",
+        "based on this",
+        "try to calculate",
+        "can you calculate",
+        "can you estimate",
+        "rough estimate",
+        "approximate risk",
+    ]
+    return _contains_any(q, keywords)
+
+
+def _is_application_specific_request(question: str) -> bool:
+    q = str(question or "").lower()
+    keywords = [
+        "my application",
+        "this application",
+        "uploaded application",
+        "my case",
+        "this case",
+        "in the document",
+        "from the form",
+        "from the uploaded",
+        "my submitted details",
+        "for this applicant",
+    ]
+    return _contains_any(q, keywords)
+
+
+def _extract_money_for_keyword(text: str, keyword: str):
+    pattern = rf"{keyword}[^0-9]{{0,30}}([0-9][0-9,]*(?:\.[0-9]+)?)\s*(crore|cr|lakh|lac|l)?"
+    m = re.search(pattern, text, flags=re.IGNORECASE)
+    if not m:
+        return None
+    num = m.group(1)
+    unit = m.group(2) or ""
+    return _parse_rupee_value(f"{num} {unit}".strip())
+
+
+def _build_profile_from_chat(question: str, chat_history: list | None = None):
+    user_lines = []
+    for item in (chat_history or []):
+        if str(item.get("role", "")).lower() == "user":
+            user_lines.append(str(item.get("content", "")))
+    user_lines.append(str(question or ""))
+    text = " ".join(user_lines).lower()
+
+    profile = {}
+
+    age_match = re.search(r"\bage\s*(?:is|:)?\s*(\d{1,3})\b", text) or re.search(r"\b(\d{1,3})\s*(?:years|yrs)\b", text)
+    if age_match:
+        profile["age"] = int(age_match.group(1))
+
+    bmi_match = re.search(r"\bbmi\s*(?:is|:)?\s*(\d{1,2}(?:\.\d+)?)\b", text)
+    if bmi_match:
+        profile["bmi"] = float(bmi_match.group(1))
+
+    if _contains_any(text, ["smoke daily", "current smoker", "i smoke", "smoker", "tobacco"]):
+        profile["smoking"] = "current"
+    elif _contains_any(text, ["former smoker", "quit smoking", "ex-smoker", "used to smoke"]):
+        profile["smoking"] = "former"
+    elif _contains_any(text, ["non smoker", "non-smoker", "never smoked", "do not smoke"]):
+        profile["smoking"] = "non"
+
+    if _contains_any(text, ["no pre-existing", "none pre-existing", "no medical condition", "healthy"]):
+        profile["pre_existing"] = "none"
+    elif _contains_any(text, ["mild", "allergy", "asthma mild", "thyroid mild"]):
+        profile["pre_existing"] = "mild"
+    elif _contains_any(text, ["hypertension", "diabetes", "moderate", "managed condition"]):
+        profile["pre_existing"] = "moderate"
+    elif _contains_any(text, ["cancer", "heart disease", "kidney failure", "severe", "stroke"]):
+        profile["pre_existing"] = "severe"
+
+    if re.search(r"occupation\s*(?:risk)?\s*(?:is|:)?\s*high", text):
+        profile["occupation_risk"] = "high"
+    elif re.search(r"occupation\s*(?:risk)?\s*(?:is|:)?\s*medium", text):
+        profile["occupation_risk"] = "medium"
+    elif re.search(r"occupation\s*(?:risk)?\s*(?:is|:)?\s*low", text):
+        profile["occupation_risk"] = "low"
+    elif _contains_any(text, ["construction", "mining", "military", "pilot", "hazardous occupation"]):
+        profile["occupation_risk"] = "high"
+    elif _contains_any(text, ["sales", "nurse", "delivery", "field job"]):
+        profile["occupation_risk"] = "medium"
+    elif _contains_any(text, ["office", "it", "teacher", "accountant", "desk job"]):
+        profile["occupation_risk"] = "low"
+
+    if _contains_any(text, ["no family history", "family history none"]):
+        profile["family_history"] = "none"
+    elif _contains_any(text, ["family history serious", "serious family history"]):
+        profile["family_history"] = "serious"
+    elif _contains_any(text, ["family history", "father had", "mother had", "diabetes in family", "bp in family"]):
+        profile["family_history"] = "moderate"
+    if _contains_any(text, ["family history of cancer", "heart attack in family", "stroke in family", "serious family history"]):
+        profile["family_history"] = "serious"
+
+    if re.search(r"lifestyle\s*(?:risk)?\s*(?:is|:)?\s*high", text):
+        profile["lifestyle"] = "high"
+    elif re.search(r"lifestyle\s*(?:risk)?\s*(?:is|:)?\s*moderate", text):
+        profile["lifestyle"] = "moderate"
+    elif re.search(r"lifestyle\s*(?:risk)?\s*(?:is|:)?\s*low", text):
+        profile["lifestyle"] = "low"
+    elif _contains_any(text, ["extreme sports", "adventure sports", "heavy alcohol", "racing"]):
+        profile["lifestyle"] = "high"
+    elif _contains_any(text, ["regular travel", "moderate sports", "social drinking"]):
+        profile["lifestyle"] = "moderate"
+    elif _contains_any(text, ["no alcohol", "sedentary", "low risk lifestyle", "regular walking"]):
+        profile["lifestyle"] = "low"
+
+    ratio_match = re.search(r"(\d+(?:\.\d+)?)\s*x\s*(?:annual\s*)?income", text)
+    if ratio_match:
+        profile["coverage_income_ratio"] = float(ratio_match.group(1))
+    else:
+        coverage_amount = (
+            _extract_money_for_keyword(text, "coverage")
+            or _extract_money_for_keyword(text, "sum assured")
+            or _extract_money_for_keyword(text, "sum insured")
+        )
+        income_amount = _extract_money_for_keyword(text, "income") or _extract_money_for_keyword(text, "salary")
+        if coverage_amount and income_amount and income_amount > 0:
+            profile["coverage_income_ratio"] = round(coverage_amount / income_amount, 2)
+
+    return profile
+
+
+def _missing_profile_fields(profile: dict):
+    required = [
+        ("age", "Age"),
+        ("bmi", "BMI"),
+        ("smoking", "Smoking status (non/former/current)"),
+        ("pre_existing", "Pre-existing condition severity (none/mild/moderate/severe)"),
+        ("occupation_risk", "Occupation risk (low/medium/high)"),
+        ("family_history", "Family history severity (none/moderate/serious)"),
+        ("coverage_income_ratio", "Coverage-to-income ratio (e.g., 12x)"),
+        ("lifestyle", "Lifestyle risk (low/moderate/high)"),
+    ]
+    missing = [label for key, label in required if key not in profile]
+    return missing
+
+
+def _calculate_risk_from_profile(profile: dict):
+    age = int(profile["age"])
+    bmi = float(profile["bmi"])
+    smoking = str(profile["smoking"]).lower()
+    pre_existing = str(profile["pre_existing"]).lower()
+    occupation_risk = str(profile["occupation_risk"]).lower()
+    family_history = str(profile["family_history"]).lower()
+    ratio = float(profile["coverage_income_ratio"])
+    lifestyle = str(profile["lifestyle"]).lower()
+
+    factors = []
+
+    age_score = 1 if 25 <= age <= 45 else 3 if (46 <= age <= 60 or 18 <= age <= 24) else 5
+    factors.append(("Age", age_score, f"{age} years"))
+
+    bmi_score = 1 if 18.5 <= bmi <= 24.9 else 3 if 25 <= bmi <= 29.9 else 5
+    factors.append(("BMI", bmi_score, str(bmi)))
+
+    smoking_score_map = {"non": 0, "former": 2, "current": 5}
+    factors.append(("Smoking", smoking_score_map.get(smoking, 5), smoking))
+
+    pre_existing_map = {"none": 0, "mild": 2, "moderate": 4, "severe": 6}
+    factors.append(("Pre-existing Conditions", pre_existing_map.get(pre_existing, 4), pre_existing))
+
+    occupation_map = {"low": 1, "medium": 3, "high": 5}
+    factors.append(("Occupation Risk", occupation_map.get(occupation_risk, 3), occupation_risk))
+
+    family_map = {"none": 0, "moderate": 2, "serious": 4}
+    factors.append(("Family History", family_map.get(family_history, 2), family_history))
+
+    coverage_score = 1 if ratio < 10 else 2 if ratio <= 15 else 3
+    factors.append(("Coverage to Income Ratio", coverage_score, f"{ratio}x"))
+
+    lifestyle_map = {"low": 0, "moderate": 1, "high": 4}
+    factors.append(("Lifestyle", lifestyle_map.get(lifestyle, 1), lifestyle))
+
+    total = sum(item[1] for item in factors)
+    score_pct = round((total / 48) * 100)
+    category = "LOW" if score_pct < 30 else "MEDIUM" if score_pct < 60 else "HIGH" if score_pct <= 80 else "SEVERELY_HIGH"
+    recommendation = (
+        "APPROVE"
+        if category == "LOW"
+        else "APPROVE_WITH_CONDITIONS"
+        if category == "MEDIUM"
+        else "REFER_TO_SENIOR"
+        if category == "HIGH"
+        else "DECLINE"
+    )
+    return {"factors": factors, "score_pct": score_pct, "category": category, "recommendation": recommendation}
+
+
+def _score_category(score_pct: int) -> str:
+    if score_pct < 30:
+        return "LOW"
+    if score_pct < 60:
+        return "MEDIUM"
+    if score_pct <= 80:
+        return "HIGH"
+    return "SEVERELY_HIGH"
+
+
+def _calculate_partial_risk_from_profile(profile: dict):
+    known = {}
+    if "age" in profile:
+        age = int(profile["age"])
+        known["Age"] = 1 if 25 <= age <= 45 else 3 if (46 <= age <= 60 or 18 <= age <= 24) else 5
+    if "bmi" in profile:
+        bmi = float(profile["bmi"])
+        known["BMI"] = 1 if 18.5 <= bmi <= 24.9 else 3 if 25 <= bmi <= 29.9 else 5
+    if "smoking" in profile:
+        known["Smoking"] = {"non": 0, "former": 2, "current": 5}.get(str(profile["smoking"]).lower(), 5)
+    if "pre_existing" in profile:
+        known["Pre-existing Conditions"] = {"none": 0, "mild": 2, "moderate": 4, "severe": 6}.get(
+            str(profile["pre_existing"]).lower(), 4
+        )
+    if "occupation_risk" in profile:
+        known["Occupation Risk"] = {"low": 1, "medium": 3, "high": 5}.get(str(profile["occupation_risk"]).lower(), 3)
+    if "family_history" in profile:
+        known["Family History"] = {"none": 0, "moderate": 2, "serious": 4}.get(str(profile["family_history"]).lower(), 2)
+    if "coverage_income_ratio" in profile:
+        ratio = float(profile["coverage_income_ratio"])
+        known["Coverage to Income Ratio"] = 1 if ratio < 10 else 2 if ratio <= 15 else 3
+    if "lifestyle" in profile:
+        known["Lifestyle"] = {"low": 0, "moderate": 1, "high": 4}.get(str(profile["lifestyle"]).lower(), 1)
+
+    bounds = {
+        "Age": (1, 5, 3),
+        "BMI": (1, 5, 3),
+        "Smoking": (0, 5, 3),
+        "Pre-existing Conditions": (0, 6, 3),
+        "Occupation Risk": (1, 5, 3),
+        "Family History": (0, 4, 2),
+        "Coverage to Income Ratio": (1, 3, 2),
+        "Lifestyle": (0, 4, 1),
+    }
+
+    min_total = 0
+    max_total = 0
+    mid_total = 0
+    for factor, (vmin, vmax, vmid) in bounds.items():
+        if factor in known:
+            s = known[factor]
+            min_total += s
+            max_total += s
+            mid_total += s
+        else:
+            min_total += vmin
+            max_total += vmax
+            mid_total += vmid
+
+    min_score = round((min_total / 48) * 100)
+    max_score = round((max_total / 48) * 100)
+    estimate_score = round((mid_total / 48) * 100)
+
+    return {
+        "known_factor_scores": known,
+        "estimate_score": estimate_score,
+        "min_score": min_score,
+        "max_score": max_score,
+        "estimate_category": _score_category(estimate_score),
+        "min_category": _score_category(min_score),
+        "max_category": _score_category(max_score),
+    }
+
+
+def _enrich_profile_from_assessment(profile: dict, assessment: dict):
+    """Fill missing profile fields from assessed summary/factors when available."""
+    enriched = dict(profile or {})
+    data = assessment or {}
+    summary = data.get("applicant_summary", {}) if isinstance(data, dict) else {}
+    factors = data.get("risk_factors", []) if isinstance(data, dict) else []
+
+    if "age" not in enriched:
+        try:
+            enriched["age"] = int(summary.get("age"))
+        except Exception:
+            pass
+
+    factor_map = {str(item.get("factor", "")).strip().lower(): str(item.get("value", "")).lower() for item in factors}
+
+    if "smoking" not in enriched:
+        smoking_val = factor_map.get("smoking", "")
+        if "current" in smoking_val:
+            enriched["smoking"] = "current"
+        elif "former" in smoking_val:
+            enriched["smoking"] = "former"
+        elif "non" in smoking_val:
+            enriched["smoking"] = "non"
+
+    if "pre_existing" not in enriched:
+        ped = factor_map.get("pre-existing conditions", "")
+        if "none" in ped:
+            enriched["pre_existing"] = "none"
+        elif "mild" in ped:
+            enriched["pre_existing"] = "mild"
+        elif "severe" in ped:
+            enriched["pre_existing"] = "severe"
+        elif ped:
+            enriched["pre_existing"] = "moderate"
+
+    if "bmi" not in enriched:
+        bmi_txt = factor_map.get("bmi", "")
+        bmi_match = re.search(r"\d{1,2}(?:\.\d+)?", bmi_txt)
+        if bmi_match:
+            enriched["bmi"] = float(bmi_match.group(0))
+
+    if "coverage_income_ratio" not in enriched:
+        ratio = _coverage_income_ratio(summary)
+        if ratio is not None:
+            enriched["coverage_income_ratio"] = round(float(ratio), 2)
+
+    return enriched
+
+
+def _build_personalized_plan_response(
+    question: str,
+    assessment: dict,
+    history: list | None,
+    application_text: str,
+    tnc_text: str,
+    report: str,
+) -> str:
+    use_case_context = _is_application_specific_request(question)
+    profile = _build_profile_from_chat(question, chat_history=history)
+    if use_case_context:
+        profile = _enrich_profile_from_assessment(profile, assessment)
+
+    missing = _missing_profile_fields(profile)
+    risk_computed = None
+    if not missing:
+        risk_computed = _calculate_risk_from_profile(profile)
+
+    if risk_computed:
+        risk_score = risk_computed["score_pct"]
+    elif use_case_context:
+        try:
+            risk_score = int((assessment or {}).get("overall_risk_score"))
+        except Exception:
+            risk_score = None
+    else:
+        risk_score = None
+
+    plans = recommend_health_plans(
+        assessment=assessment,
+        max_plans=3,
+        profile=profile,
+        risk_score=risk_score,
+    )
+
+    risk_summary = ""
+    if risk_computed:
+        risk_summary = (
+            f"Inferred risk from provided details: {risk_computed['score_pct']}/100 "
+            f"({risk_computed['category']}), recommendation: {risk_computed['recommendation']}."
+        )
+
+    if is_api_configured():
+        try:
+            llm = _create_llm(MODEL_FAST, temperature=0.2, max_tokens=1000)
+            if llm:
+                context_payload = {
+                    "use_case_context": use_case_context,
+                    "profile": profile,
+                    "missing_details": missing,
+                    "risk_computed": risk_computed,
+                    "assessment": (assessment or {}) if use_case_context else {},
+                    "report": str(report or "")[:3000] if use_case_context else "",
+                    "application_excerpt": _trim_application_text(application_text) if use_case_context else "",
+                    "tnc_excerpt": _trim_tnc_text(tnc_text),
+                    "plan_catalog": get_health_plan_catalog(),
+                    "shortlisted_plans": plans,
+                    "user_question": question,
+                }
+                messages = [
+                    {"role": "system", "content": PLAN_RECOMMENDATION_PROMPT},
+                    {"role": "user", "content": json.dumps(context_payload, ensure_ascii=False)},
+                ]
+                response = llm.invoke(messages)
+                text = str(response.content).strip()
+                if text:
+                    return text
+        except Exception:
+            pass
+
+    base = format_plan_recommendations(plans, risk_summary=risk_summary)
+    if missing:
+        base += "\n\nTo personalize further, share: " + ", ".join(missing) + "."
+    return base
 
 
 def _parse_rupee_value(value: str):
@@ -521,6 +970,47 @@ def chat_with_underwriter_assistant(
     assessment = assessment or {}
     history = chat_history or []
     compact_history = history[-8:]
+    profile = _build_profile_from_chat(question, chat_history=history)
+    risk_intent = _is_risk_prediction_request(question) or (_is_partial_risk_followup(question) and len(profile) >= 2)
+    if risk_intent:
+        missing = _missing_profile_fields(profile)
+        if missing:
+            partial = _calculate_partial_risk_from_profile(profile)
+            captured = []
+            for key in ["age", "bmi", "smoking", "pre_existing", "occupation_risk", "family_history", "coverage_income_ratio", "lifestyle"]:
+                if key in profile:
+                    captured.append(f"{key}={profile[key]}")
+            captured_text = ", ".join(captured) if captured else "none yet"
+            lines = [
+                "Provisional risk estimate (partial inputs):",
+                f"- Estimated Score: {partial['estimate_score']}/100 ({partial['estimate_category']})",
+                f"- Possible Range: {partial['min_score']} to {partial['max_score']} "
+                f"({partial['min_category']} to {partial['max_category']})",
+                f"- Captured so far: {captured_text}",
+                f"- Missing for final score: {', '.join(missing)}",
+                "Share missing details to get a final factor-by-factor score.",
+            ]
+            return "\n".join(lines)
+        computed = _calculate_risk_from_profile(profile)
+        lines = ["Risk estimate using scoring guide:"]
+        for factor_name, factor_score, factor_value in computed["factors"]:
+            lines.append(f"- {factor_name}: {factor_value} -> {factor_score}/6")
+        lines.append(
+            f"Total Risk Score: {computed['score_pct']}/100 | Category: {computed['category']} | "
+            f"Recommendation: {computed['recommendation']}"
+        )
+        lines.append("This is a preliminary estimate from self-reported details and should be validated by underwriting.")
+        return "\n".join(lines)
+
+    if _is_plan_request(question):
+        return _build_personalized_plan_response(
+            question=question,
+            assessment=assessment,
+            history=history,
+            application_text=application_text,
+            tnc_text=tnc_text,
+            report=report,
+        )
 
     if is_api_configured():
         try:
@@ -534,12 +1024,20 @@ def chat_with_underwriter_assistant(
                     if role in {"user", "assistant"} and content:
                         messages.append({"role": role, "content": content})
 
+                use_case_context = _is_application_specific_request(question)
                 context_payload = {
-                    "assessment": assessment,
-                    "report": str(report or "")[:4000],
-                    "application_excerpt": _trim_application_text(application_text),
+                    "use_case_context": use_case_context,
                     "tnc_excerpt": _trim_tnc_text(tnc_text),
+                    "plan_catalog": get_health_plan_catalog(),
                 }
+                if use_case_context:
+                    context_payload.update(
+                        {
+                            "assessment": assessment,
+                            "report": str(report or "")[:4000],
+                            "application_excerpt": _trim_application_text(application_text),
+                        }
+                    )
                 messages.append(
                     {
                         "role": "user",
@@ -553,10 +1051,10 @@ def chat_with_underwriter_assistant(
         except Exception:
             pass
 
-    return _chat_fallback_local(question, assessment)
+    return _chat_fallback_local(question, assessment, chat_history=history)
 
 
-def _chat_fallback_local(question: str, assessment: dict) -> str:
+def _chat_fallback_local(question: str, assessment: dict, chat_history: list | None = None) -> str:
     q = question.lower()
     score = assessment.get("overall_risk_score", "N/A")
     category = assessment.get("risk_category", "N/A")
@@ -578,9 +1076,32 @@ def _chat_fallback_local(question: str, assessment: dict) -> str:
             return "No key concerns were extracted."
         return "Top concerns: " + "; ".join(concerns[:5])
 
+    if _is_plan_request(question):
+        profile = _build_profile_from_chat(question, chat_history=chat_history)
+        if _is_application_specific_request(question):
+            profile = _enrich_profile_from_assessment(profile, assessment)
+        missing = _missing_profile_fields(profile)
+        risk = _calculate_risk_from_profile(profile) if not missing else None
+        plans = recommend_health_plans(
+            assessment=assessment,
+            max_plans=3,
+            profile=profile,
+            risk_score=(risk or {}).get("score_pct"),
+        )
+        summary = ""
+        if risk:
+            summary = (
+                f"Inferred risk from provided details: {risk['score_pct']}/100 "
+                f"({risk['category']}), recommendation: {risk['recommendation']}."
+            )
+        text = format_plan_recommendations(plans, risk_summary=summary)
+        if missing:
+            text += "\n\nTo personalize further, share: " + ", ".join(missing) + "."
+        return text
+
     return (
-        "I can help with risk score, factor explanations, recommendation rationale, and compliance checks. "
-        "Analyze an application first for detailed case-specific answers."
+        "I can help with health insurance risk score, PED/waiting-period implications, recommendation rationale, "
+        "compliance checks, and plan suggestions."
     )
 
 

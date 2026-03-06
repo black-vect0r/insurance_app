@@ -1,5 +1,5 @@
-"""
-📊 Accuracy Evaluation Module
+﻿"""
+ðŸ“Š Accuracy Evaluation Module
 Measures AI risk factor extraction accuracy against human-labeled ground truth.
 
 Methodology:
@@ -9,17 +9,17 @@ Methodology:
   4. Calculate accuracy per factor and overall
   5. Generate eval report
 
-Success Criteria: ≥80% accuracy in risk factor extraction
+Success Criteria: â‰¥80% accuracy in risk factor extraction
 """
 
 import json
 from datetime import datetime
 
 
-# ═══════════════════════════════════════
-# GROUND TRUTH — Manually labeled
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# GROUND TRUTH â€” Manually labeled
 # (This is what a human underwriter would identify)
-# ═══════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 GROUND_TRUTH = [
     {
         "applicant": "Rajesh Kumar Sharma",
@@ -104,9 +104,9 @@ GROUND_TRUTH = [
 ]
 
 
-# ═══════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 # Factor name normalization
-# ═══════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 FACTOR_ALIASES = {
     "age":                    "Age",
     "bmi":                    "BMI",
@@ -153,9 +153,9 @@ def normalize_category(name: str) -> str:
     return cat
 
 
-# ═══════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 # Evaluation Logic
-# ═══════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 def evaluate_single(ai_assessment: dict, ground_truth: dict) -> dict:
     """
     Compare one AI assessment against ground truth.
@@ -259,24 +259,26 @@ def evaluate_single(ai_assessment: dict, ground_truth: dict) -> dict:
     }
 
 
-def run_full_evaluation(assessments: list) -> dict:
+def run_full_evaluation(assessments: list, ground_truth: list | None = None) -> dict:
     """
-    Run evaluation across all 5 sample applications.
+    Run evaluation across provided sample applications.
     
     Args:
-        assessments: list of 5 AI assessment dicts (one per sample)
+        assessments: list of AI assessment dicts (one per sample)
+        ground_truth: optional list of ground-truth entries to evaluate against
     
     Returns:
         Full evaluation report with per-applicant and overall accuracy
     """
-    if len(assessments) != len(GROUND_TRUTH):
-        return {"error": f"Expected {len(GROUND_TRUTH)} assessments, got {len(assessments)}"}
+    truth_set = ground_truth if ground_truth is not None else GROUND_TRUTH
+    if len(assessments) != len(truth_set):
+        return {"error": f"Expected {len(truth_set)} assessments, got {len(assessments)}"}
 
     eval_results = []
     total_passed = 0
     total_checks = 0
 
-    for i, (ai_result, truth) in enumerate(zip(assessments, GROUND_TRUTH)):
+    for i, (ai_result, truth) in enumerate(zip(assessments, truth_set)):
         if "error" in ai_result:
             eval_results.append({"applicant": truth["applicant"], "error": ai_result["error"], "accuracy": 0})
             continue
@@ -335,24 +337,24 @@ def run_full_evaluation(assessments: list) -> dict:
 def format_eval_report(eval_result: dict) -> str:
     """Format evaluation result as a readable markdown report."""
     if "error" in eval_result:
-        return f"⚠️ {eval_result['error']}"
+        return f"âš ï¸ {eval_result['error']}"
 
     overall = eval_result["overall_accuracy"]
     meets = eval_result["meets_80_target"]
-    badge = "✅ PASS" if meets else "❌ FAIL"
-
-    report = f"""# 📊 Risk Factor Extraction — Accuracy Report
+    badge = "PASS" if meets else "FAIL"
+    apps_evaluated = int(eval_result.get("summary", {}).get("applicants_evaluated", 0))
+    report = f"""# ðŸ“Š Risk Factor Extraction â€” Accuracy Report
 **Date:** {eval_result['timestamp']}
-**Target:** ≥80% accuracy | **Result:** {overall}% | **Status:** {badge}
+**Target:** â‰¥80% accuracy | **Result:** {overall}% | **Status:** {badge}
 
 ---
 
 ## Overall Results
 - **Accuracy:** {overall}% ({eval_result['total_passed']}/{eval_result['total_checks']} checks passed)
-- **Target Met:** {'Yes ✅' if meets else 'No ❌'}
+- **Target Met:** {'Yes âœ…' if meets else 'No âŒ'}
 - **Applications Evaluated:** {eval_result['summary']['applicants_evaluated']}
-- **Category Matches:** {eval_result['summary']['category_matches']}/5
-- **Recommendation Matches:** {eval_result['summary']['recommendation_matches']}/5
+- **Category Matches:** {eval_result['summary']['category_matches']}/{apps_evaluated}
+- **Recommendation Matches:** {eval_result['summary']['recommendation_matches']}/{apps_evaluated}
 
 ---
 
@@ -360,18 +362,18 @@ def format_eval_report(eval_result: dict) -> str:
 """
     for r in eval_result["per_applicant"]:
         if "error" in r:
-            report += f"\n### ❌ {r['applicant']}\nError: {r['error']}\n"
+            report += f"\n### âŒ {r['applicant']}\nError: {r['error']}\n"
             continue
 
-        icon = "✅" if r["accuracy"] >= 80 else "⚠️" if r["accuracy"] >= 60 else "❌"
+        icon = "âœ…" if r["accuracy"] >= 80 else "âš ï¸" if r["accuracy"] >= 60 else "âŒ"
         report += f"""
-### {icon} {r['applicant']} — {r['accuracy']}%
+### {icon} {r['applicant']} â€” {r['accuracy']}%
 - Factors Detected: {r['factors_detected']}/{r['factors_expected']}
 - Risk Levels Correct: {r['risk_levels_correct']}/{r['factors_expected']}
 - Scores in Range: {r['scores_in_range']}/{r['factors_expected']}
-- Category: AI={r['ai_category']} vs Expected={r['expected_category']} {'✅' if r['category_match'] else '❌'}
-- Score: AI={r['ai_score']} vs Expected Range={r['expected_score_range']} {'✅' if r['score_in_range'] else '❌'}
-- Recommendation: AI={r['ai_recommendation']} vs Expected={r['expected_recommendation']} {'✅' if r['recommendation_match'] else '❌'}
+- Category: AI={r['ai_category']} vs Expected={r['expected_category']} {'âœ…' if r['category_match'] else 'âŒ'}
+- Score: AI={r['ai_score']} vs Expected Range={r['expected_score_range']} {'âœ…' if r['score_in_range'] else 'âŒ'}
+- Recommendation: AI={r['ai_recommendation']} vs Expected={r['expected_recommendation']} {'âœ…' if r['recommendation_match'] else 'âŒ'}
 """
 
     report += "\n---\n\n## Per-Factor Accuracy\n"
@@ -381,3 +383,4 @@ def format_eval_report(eval_result: dict) -> str:
         report += f"| {factor} | {acc['detection_rate']}% | {acc['level_accuracy']}% | {acc['score_accuracy']}% |\n"
 
     return report
+

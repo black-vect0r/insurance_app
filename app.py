@@ -449,9 +449,9 @@ with tab_assess:
 # TAB 2: UNDERWRITER CHATBOT
 # 
 with tab_chat:
-    st.markdown("### Underwriter Chatbot")
+    st.markdown("### Health Insurance Chatbot")
     st.markdown(
-        "Ask underwriting questions grounded in uploaded application details, generated risk output, and local policy T&C."
+        "Ask health-insurance underwriting questions grounded in uploaded application details, generated risk output, and local policy T&C. For risk prediction, the bot will first collect required details per scoring guide."
     )
 
     if str(st.session_state.tnc_text).startswith("[ERROR]"):
@@ -467,7 +467,9 @@ with tab_chat:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
-    prompt = st.chat_input("Ask about risk factors, recommendation rationale, or compliance gaps...")
+    prompt = st.chat_input(
+        "Ask about PED/exclusions/compliance, or share age, BMI, smoking, pre-existing severity, occupation risk, family history, coverage-income ratio, lifestyle for risk scoring..."
+    )
     if prompt:
         st.session_state.chat_messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
@@ -496,7 +498,7 @@ with tab_chat:
 with tab_eval:
     st.markdown("###  Accuracy Evaluation  Does the AI meet 80% target?")
     st.markdown("""
-    This runs the AI on all **5 sample applications** and compares results against 
+    This runs the AI on the first **4 sample applications** and compares results against 
     **human-labeled ground truth**. Each application is checked for:
     
     -  **Factor Detection**  Did the AI find all 8 risk factors?
@@ -509,20 +511,22 @@ with tab_eval:
     if not is_api_configured():
         st.warning("API key not configured. Set `GENAILAB_API_KEY` in `.env` to run evaluation.")
     else:
-        if st.button(" Run Full Accuracy Evaluation (5 applications)", type="primary", use_container_width=True):
+        if st.button(" Run Full Accuracy Evaluation (4 applications)", type="primary", use_container_width=True):
             from backend.evaluator import GROUND_TRUTH, run_full_evaluation, format_eval_report
 
+            eval_count = 4
+            selected_truth = GROUND_TRUTH[:eval_count]
             assessments = []
             progress = st.progress(0, text="Starting evaluation...")
 
-            for i in range(5):
-                progress.progress((i) / 5, text=f"Assessing application {i+1}/5: {GROUND_TRUTH[i]['applicant']}...")
+            for i in range(eval_count):
+                progress.progress((i) / eval_count, text=f"Assessing application {i+1}/{eval_count}: {selected_truth[i]['applicant']}...")
                 app_text = get_sample_application_text(i)
                 result = assess_risk(app_text)
                 assessments.append(result)
 
             progress.progress(1.0, text="Running accuracy checks...")
-            st.session_state.eval_result = run_full_evaluation(assessments)
+            st.session_state.eval_result = run_full_evaluation(assessments, ground_truth=selected_truth)
             st.rerun()
 
         if st.session_state.eval_result:
